@@ -444,6 +444,9 @@ class NordpoolSensor(SensorEntity):
     async def handle_new_day(self):
         """Update attrs for the new day"""
         _LOGGER.debug("handle_new_day")
+        # Reset tomorrows data. The last known current price is kept in
+        # _current_price so the state does not flap to unavailable while
+        # the first fetch of the new day is still in flight (issue #502/#528).
         self._data_tomorrow = None
         # update attrs for the new day
         await self.handle_new_hr()
@@ -466,9 +469,19 @@ class NordpoolSensor(SensorEntity):
         self._update()
         # Updates the current for this hour.
         await self._update_current_price()
-        # This is not to make sure the correct template costs are set. Issue 258
-        self._attr_native_value = self.current_price
-        self.async_write_ha_state()
+        # State-hold for issue #502: if the current price could not be
+        # refreshed (for example during the day-ahead publication gap or a
+        # failed fetch), keep the last known value instead of writing an
+        # unavailable state. This mirrors how other integrations handle
+        # temporary upstream outages.
+        if self._current_price is not None:
+            self._attr_native_value = self.current_price
+            self.async_write_ha_state()
+        else:
+            _LOGGER.debug(
+                "%s: no current price available, keeping last known state",
+                self.name,
+            )
 
     async def handle_new_price(self):
         """Update atts because of the new prices"""

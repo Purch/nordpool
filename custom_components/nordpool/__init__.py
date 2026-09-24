@@ -2,7 +2,7 @@ import logging
 from collections import defaultdict
 from datetime import timedelta
 
-
+import aiohttp
 import backoff
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -16,6 +16,7 @@ from homeassistant.util import dt as dt_utils
 from .aio_price import AioPrices, InvalidValueException
 from .events import async_track_time_change_in_tz
 from .services import async_setup_services
+from .misc import stock
 
 from .const import (
     NAME,
@@ -56,6 +57,10 @@ class NordpoolData:
         self.currency = []
         self.listeners = []
         self.areas = []
+        # Throttle for the hourly "if tomorrow is still invalid, try again"
+        # self-heal fetch (issue #502: silent failure on empty API response
+        # left the sensor without tomorrows prices until a reload).
+        self._tomorrow_retry_after = None
 
     async def _update(self, type_="today", dt=None, areas=None):
         _LOGGER.debug("calling _update %s %s %s", type_, dt, areas)
@@ -78,6 +83,31 @@ class NordpoolData:
             )
             if data:
                 self._data[currency][type_] = data["areas"]
+
+    def tomorrow_valid(self) -> bool:
+        """Check if we have a full set of tomorrows prices for all currencies.
+
+        Used by the hourly self-heal check so a failed fetch at the
+        13:00ish CET publication time (issue #502) is retried instead of
+        leaving the sensor without tomorrows prices until a manual reload.
+        """
+        if not self.currency:
+            return False
+        return all(
+            self._tomorrow_valid_for_currency(currency)
+            for currency in self.currency
+        )
+
+    def _tomorrow_valid_for_currency(self, currency) -> bool:
+        """Check if tomorrows prices for one currency contain data for
+        every registered area. Matches the sensor side threshold (>= 23
+        valid hours, see NordpoolSensor.tomorrow_valid)."""
+        areas = self._data.get(currency, {}).get("tomorrow") or {}
+        for area in self.areas:
+            values = (areas.get(area) or {}).get("values") or []
+            if len(values) < 23:
+                return False
+        return True
 
     async def update_today(self, areas=None):
         """Update today's prices"""
@@ -134,6 +164,61 @@ class NordpoolData:
         """Returns tomorrow's prices in an area in the requested currency"""
         return await self._someday(area, currency, "tomorrow")
 
+    async def maybe_refetch_tomorrow(self, now) -> bool:
+        """Self-heal for issue #502: refetch tomorrows prices if missing.
+
+        If fetching tomorrows prices at the 13:00ish CET publication time
+        silently failed (empty API response), retry at most once every 15
+        minutes until the data is available, so a manual reload is not
+        needed. Returns True if a valid dataset was fetched.
+        """
+        stockholm_now = stock(now)
+        publication = stockholm_now.replace(
+            hour=13, minute=RANDOM_MINUTE, second=RANDOM_SECOND
+        )
+        if stockholm_now < publication:
+            return False
+        if self.tomorrow_valid():
+            return False
+        if self._tomorrow_retry_after is not None and now < self._tomorrow_retry_after:
+            return False
+
+        self._tomorrow_retry_after = now + timedelta(minutes=15)
+        _LOGGER.debug("Self-heal: refetching tomorrows prices")
+        try:
+            await self.update_tomorrow()
+        except InvalidValueException:
+            _LOGGER.debug("Self-heal: no valid tomorrow data yet")
+        except aiohttp.ClientError as err:
+            _LOGGER.warning("Self-heal: fetch failed: %s", err)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Self-heal: unexpected error: %s", err)
+        else:
+            if self.tomorrow_valid():
+                _LOGGER.info("Self-heal: tomorrows prices now available")
+                async_dispatcher_send(self._hass, EVENT_NEW_PRICE)
+                return True
+        return False
+
+    async def rotate_to_new_day(self) -> None:
+        """Day-change housekeeping: promote tomorrows data to today.
+
+        If the tomorrow dataset is invalid or missing (publication failed
+        the previous day), keep the old today data instead of overwriting
+        it with None, and clear the tomorrow slot for the new cycle.
+        """
+        for curr in self.currency:
+            if self._tomorrow_valid_for_currency(curr):
+                self._data[curr]["today"] = self._data[curr]["tomorrow"]
+            else:
+                try:
+                    await self.update_today()
+                except InvalidValueException:
+                    _LOGGER.debug("No valid data for today at day change")
+                except aiohttp.ClientError as err:
+                    _LOGGER.warning("Failed to update today at day change: %s", err)
+            self._data[curr]["tomorrow"] = {}
+
 
 async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up using yaml config file."""
@@ -147,18 +232,22 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             """Cb to handle some house keeping when it a new day."""
             _LOGGER.debug("Called new_day_cb callback")
 
-            for curr in api.currency:
-                if not api._data.get(curr, {}).get("tomorrow"):
-                    api._data[curr]["today"] = await api.update_today()
-                else:
-                    api._data[curr]["today"] = api._data[curr]["tomorrow"]
-                api._data[curr]["tomorrow"] = {}
+            # Reset the self-heal throttle for the new publication cycle.
+            api._tomorrow_retry_after = None
+            await api.rotate_to_new_day()
 
             async_dispatcher_send(hass, EVENT_NEW_DAY)
 
         async def new_hr(_):
             """Callback to tell the sensors to update on a new hour."""
             _LOGGER.debug("Called new_hr callback")
+
+            # Self-heal for issue #502: retry missing tomorrows prices at
+            # most once every 15 minutes after publication time. Sensors
+            # only read tomorrow data on EVENT_NEW_PRICE, which
+            # maybe_refetch_tomorrow() sends once the retry succeeds.
+            await api.maybe_refetch_tomorrow(dt_utils.now())
+
             async_dispatcher_send(hass, EVENT_NEW_HOUR)
 
         @backoff.on_exception(
