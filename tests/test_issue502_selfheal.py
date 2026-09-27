@@ -271,6 +271,72 @@ async def test_rotate_today_fetch_failure_keeps_old_data(api):
 
 
 # ---------------------------------------------------------------------------
+# Dispatcher listener cleanup + blocking-call-free timezone access
+# (regression tests for the 2026-09-27 live findings: the reload
+# automation reloaded the entry at 14:15 and the orphaned sensor kept
+# reacting to every EVENT_NEW_HOUR - "handle_new_hr" ran twice per
+# quarter hour in the logs - and pytz timezone() did a blocking
+# open() of the zoneinfo file inside the event loop)
+# ---------------------------------------------------------------------------
+
+
+def test_sensor_registers_on_remove_callbacks(sensor_mod):
+    """async_added_to_hass must wrap each dispatcher connect in
+    async_on_remove so the listeners are unsubscribed when the entity
+    is removed (otherwise a reloaded entry leaves orphan listeners)."""
+    from nordpool.const import EVENT_NEW_DAY, EVENT_NEW_PRICE, EVENT_NEW_HOUR
+
+    sensor = _make_sensor(sensor_mod, current_price=None, data_today=None)
+
+    removals = []
+    sensor.async_on_remove = MagicMock(side_effect=removals.append)
+    sensor._api._hass = MagicMock()
+
+    async def _noop():
+        return None
+
+    sensor.handle_new_day = _noop
+    sensor.handle_new_price = _noop
+    sensor.handle_new_hr = _noop
+
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+
+    @pytest.mark.asyncio
+    async def _run():
+        # Call the real async_added_to_hass; the conftest base entity has
+        # no parent logic, so super().async_added_to_hass() is a no-op.
+        await sensor_mod.NordpoolSensor.async_added_to_hass.__get__(sensor)()
+
+    asyncio.run(_run())
+
+    assert len(removals) == 3
+    # Every connect result was registered for removal
+    for unsub in removals:
+        assert callable(unsub)
+
+
+def test_area_tzinfo_cache_has_no_blocking_lookup(sensor_mod):
+    """tomorrow_valid must resolve tz via the module-level AREA_TZINFO
+    cache, never by calling pytz timezone() (blocking open()) inside
+    the event loop."""
+    import inspect
+    import nordpool.misc as misc_mod
+
+    source = inspect.getsource(
+        sensor_mod.NordpoolSensor.tomorrow_valid.fget
+    )
+    assert "timezone(" not in source
+    assert "AREA_TZINFO" in source
+    # Cache actually contains the FI zone object
+    assert "Europe/Helsinki" in {tz.zone for tz in misc_mod.AREA_TZINFO.values()}
+
+
+# ---------------------------------------------------------------------------
 # Sensor state-hold
 # ---------------------------------------------------------------------------
 

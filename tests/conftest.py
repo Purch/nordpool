@@ -156,6 +156,12 @@ def _install_ha_stubs():
         def async_write_ha_state(self):
             pass
 
+        async def async_added_to_hass(self):
+            """No-op stand-in for Entity.async_added_to_hass."""
+
+        def async_on_remove(self, func):
+            """No-op stand-in; tests may override on the instance."""
+
         @property
         def _attr_suggested_display_precision(self):
             return None

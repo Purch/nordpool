@@ -11,7 +11,6 @@ from homeassistant.const import CONF_REGION
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.template import Template
 from homeassistant.util import dt as dt_utils
-from pytz import timezone
 
 # Import sensor entity and classes.
 from homeassistant.components.sensor.const import (
@@ -37,8 +36,7 @@ from .const import (
     _CURRENTY_TO_CENTS,
     _CENT_MULTIPLIER,
 )
-from .misc import start_of, stock
-
+from .misc import start_of, stock, day_coverage, AREA_TZINFO
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -431,16 +429,12 @@ class NordpoolSensor(SensorEntity):
         dataset as complete. Use interval coverage of the whole local
         day instead, which works for 60- and 15-minute data alike.
         """
-        from .misc import day_coverage
-        from .const import tzs as _tzs
-
         if self._data_tomorrow is None or self._data_tomorrow is SENTINEL:
             return False
-        zone_name = _tzs.get(self._area)
-        if zone_name is None:
+        tzinfo = AREA_TZINFO.get(self._area)
+        if tzinfo is None:
             return False
         target = (stock(dt_utils.now()) + timedelta(days=1)).date()
-        tzinfo = timezone(zone_name)
         values = self._data_tomorrow.get("values") or []
         return day_coverage(values, target, tzinfo)
 
@@ -530,9 +524,15 @@ class NordpoolSensor(SensorEntity):
         await super().async_added_to_hass()
         _LOGGER.debug("called async_added_to_hass %s", self.name)
 
-        async_dispatcher_connect(self._api._hass, EVENT_NEW_DAY, self.handle_new_day)
-        async_dispatcher_connect(
-            self._api._hass, EVENT_NEW_PRICE, self.handle_new_price
+        self.async_on_remove(
+            async_dispatcher_connect(self._api._hass, EVENT_NEW_DAY, self.handle_new_day)
         )
-        async_dispatcher_connect(self._api._hass, EVENT_NEW_HOUR, self.handle_new_hr)
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self._api._hass, EVENT_NEW_PRICE, self.handle_new_price
+            )
+        )
+        self.async_on_remove(
+            async_dispatcher_connect(self._api._hass, EVENT_NEW_HOUR, self.handle_new_hr)
+        )
         await self.handle_new_hr()

@@ -9,6 +9,8 @@ import pytz
 from homeassistant.util import dt as dt_util
 from pytz import timezone
 
+from .const import tzs as _AREA_TZ_NAMES
+
 UTC = pytz.utc
 
 __all__ = [
@@ -19,11 +21,20 @@ __all__ = [
     "end_of",
     "stock",
     "add_junk",
+    "day_coverage",
+    "AREA_TZINFO",
 ]
 
 _LOGGER = logging.getLogger(__name__)
 
 stockholm_tz = timezone("Europe/Stockholm")
+
+# Area timezone objects resolved once at import: pytz timezone() opens
+# and reads the zoneinfo file from disk on first use, which must never
+# happen inside the event loop (HA blocks and warns about the open()).
+AREA_TZINFO = {
+    area: timezone(zone_name) for area, zone_name in _AREA_TZ_NAMES.items()
+}
 
 
 def exceptions_raiser():

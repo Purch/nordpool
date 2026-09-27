@@ -18,8 +18,7 @@ from homeassistant.util import dt as dt_utils
 from .aio_price import AioPrices, InvalidValueException
 from .events import async_track_time_change_in_tz
 from .services import async_setup_services
-from .misc import stock, day_coverage
-from .const import tzs
+from .misc import stock, day_coverage, AREA_TZINFO
 
 from .const import (
     NAME,
@@ -127,11 +126,10 @@ class NordpoolData:
         5h45m partial answer as complete)."""
         areas = self._data.get(currency, {}).get("tomorrow") or {}
         for area in self.areas:
-            zone_name = tzs.get(area)
-            if zone_name is None:
+            tzinfo = AREA_TZINFO.get(area)
+            if tzinfo is None:
                 return False
             target = (stock(dt_utils.now()) + timedelta(days=1)).date()
-            tzinfo = timezone(zone_name)
             values = (areas.get(area) or {}).get("values") or []
             if not day_coverage(values, target, tzinfo):
                 return False
