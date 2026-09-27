@@ -22,12 +22,15 @@ sys.path.insert(0, str(COMPONENT_DIR))
 from conftest import dispatcher_send  # noqa: E402
 
 
-def _make_area_values(count=24, value=50.0, start_day=None):
+def _make_area_values(count=24, value=50.0, start_day=None, step_hours=1):
     """Build a values list shaped like AioPrices output.
 
     Datetimes are timezone-aware (the integration compares them against
     dt_utils.now()); the default start covers the current local day so
     "now" always falls inside the generated hours.
+
+    For tomorrow datasets pass start_day=_day_start(1) so the coverage
+    validator (which is day-anchored) sees a full next day.
     """
     if start_day is None:
         start_day = datetime.now().astimezone().replace(
@@ -37,15 +40,23 @@ def _make_area_values(count=24, value=50.0, start_day=None):
         start_day = start_day.astimezone()
     values = []
     for i in range(count):
-        start = start_day + timedelta(hours=i)
+        start = start_day + timedelta(hours=step_hours * i)
         values.append(
             {
                 "start": start,
-                "end": start + timedelta(hours=1),
+                "end": start + timedelta(hours=step_hours),
                 "value": value,
             }
         )
     return {"values": values}
+
+
+def _day_start(offset_days=0):
+    """Local midnight of today + offset, tz-aware."""
+    day = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return day + timedelta(days=offset_days)
 
 
 @pytest.fixture
@@ -82,7 +93,7 @@ def api(init_mod):
 
 
 def test_tomorrow_valid_full_data(api):
-    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(24)}
+    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(24, start_day=_day_start(1))}
     assert api.tomorrow_valid() is True
 
 
@@ -93,7 +104,7 @@ def test_tomorrow_valid_missing(api):
 
 def test_tomorrow_valid_partial(api):
     """A 4-value partial dataset (issue #528) must not count as valid."""
-    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(4)}
+    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(4, start_day=_day_start(1))}
     assert api.tomorrow_valid() is False
 
 
@@ -104,9 +115,22 @@ def test_tomorrow_valid_no_currency(init_mod):
 
 def test_tomorrow_valid_multiple_areas(api):
     api.areas = ["FI", "SE1"]
-    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(24)}
+    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(24, start_day=_day_start(1))}
     assert api.tomorrow_valid() is False  # SE1 missing
-    api._data["EUR"]["tomorrow"]["SE1"] = _make_area_values(24)
+    # SE1 is a Stockholm area: anchor its rows to the Stockholm midnight
+    # (the API serves area-anchored local days, not a shared midnight).
+    from zoneinfo import ZoneInfo
+
+    stockholm_midnight = (
+        datetime.now(ZoneInfo("Europe/Stockholm"))
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    )
+    se1 = []
+    for i in range(24):
+        s = stockholm_midnight + timedelta(hours=i)
+        se1.append({"start": s, "end": s + timedelta(hours=1), "value": 50.0})
+    api._data["EUR"]["tomorrow"]["SE1"] = {"values": se1}
     assert api.tomorrow_valid() is True
 
 
@@ -134,8 +158,11 @@ async def test_refetch_not_before_publication(api):
 @pytest.mark.asyncio
 async def test_refetch_fetches_when_missing(api):
     async def _fetch_ok(areas=None):
-        api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(24)}
+        api._data["EUR"]["tomorrow"] = {
+            "FI": _make_area_values(24, start_day=_day_start(1))
+        }
 
+    api.update_today = AsyncMock()  # today-heal must not fire real fetches
     api.update_tomorrow = AsyncMock(side_effect=_fetch_ok)
     assert await api.maybe_refetch_tomorrow(_after_publication()) is True
     api.update_tomorrow.assert_awaited_once()
@@ -147,6 +174,7 @@ async def test_refetch_throttled(api):
     async def _fetch_no_data(areas=None):
         pass  # fetch runs but data stays missing
 
+    api.update_today = AsyncMock()  # today-heal must not fire real fetches
     api.update_tomorrow = AsyncMock(side_effect=_fetch_no_data)
     now = _after_publication()
     await api.maybe_refetch_tomorrow(now)
@@ -161,7 +189,9 @@ async def test_refetch_throttled(api):
 
 @pytest.mark.asyncio
 async def test_refetch_skipped_when_valid(api):
-    api._data["EUR"]["tomorrow"] = {"FI": _make_area_values(24)}
+    api._data["EUR"]["tomorrow"] = {
+        "FI": _make_area_values(24, start_day=_day_start(1))
+    }
     api.update_tomorrow = AsyncMock()
     assert await api.maybe_refetch_tomorrow(_after_publication()) is False
     api.update_tomorrow.assert_not_awaited()
@@ -205,7 +235,7 @@ async def test_refetch_unexpected_error_swallowed(api):
 async def test_rotate_promotes_valid_tomorrow(api):
     api._data["EUR"]["today"] = {"FI": _make_area_values(24, value=10.0)}
     api._data["EUR"]["tomorrow"] = {
-        "FI": _make_area_values(24, value=20.0, start_day=datetime(2026, 9, 25))
+        "FI": _make_area_values(24, value=20.0, start_day=_day_start(1))
     }
     await api.rotate_to_new_day()
     assert api._data["EUR"]["today"]["FI"]["values"][0]["value"] == 20.0

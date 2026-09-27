@@ -1,9 +1,11 @@
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import timedelta
 
 import aiohttp
 import backoff
+from pytz import timezone
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
@@ -16,7 +18,8 @@ from homeassistant.util import dt as dt_utils
 from .aio_price import AioPrices, InvalidValueException
 from .events import async_track_time_change_in_tz
 from .services import async_setup_services
-from .misc import stock
+from .misc import stock, day_coverage
+from .const import tzs
 
 from .const import (
     NAME,
@@ -61,6 +64,25 @@ class NordpoolData:
         # self-heal fetch (issue #502: silent failure on empty API response
         # left the sensor without tomorrows prices until a reload).
         self._tomorrow_retry_after = None
+        # Same retry state for today's dataset if the midnight fetch failed
+        # (code review finding F2: without this, a midnight fetch failure
+        # could leave the sensor showing yesterday's price all day).
+        self._today_retry_after = None
+        # One lock guards all API refreshes (review F4): publication fetch,
+        # self-heal retries and day-change fetches must not overlap, or two
+        # parallel three-day fetch groups could hammer the API.
+        self._update_lock = asyncio.Lock()
+        # Snapshot of what the API last served, used to decide whether the
+        # today data actually changed before dispatching EVENT_NEW_PRICE.
+        self._today_data_hash = None
+
+    def _area_day_target(self, area: str, offset_days: int = 0):
+        """Local target date (date object) for a given area, offset from today."""
+        zone_name = tzs.get(area)
+        if zone_name is None:
+            return None
+        local_now = stock(dt_utils.now())
+        return (local_now + timedelta(days=offset_days)).date()
 
     async def _update(self, type_="today", dt=None, areas=None):
         _LOGGER.debug("calling _update %s %s %s", type_, dt, areas)
@@ -99,14 +121,39 @@ class NordpoolData:
         )
 
     def _tomorrow_valid_for_currency(self, currency) -> bool:
-        """Check if tomorrows prices for one currency contain data for
-        every registered area. Matches the sensor side threshold (>= 23
-        valid hours, see NordpoolSensor.tomorrow_valid)."""
+        """Check if tomorrows prices for one currency fully cover the target
+        day for every registered area (review F1: with the 15-minute MTU a
+        day has 96 rows, so the old fixed >= 23 rows check accepted a
+        5h45m partial answer as complete)."""
         areas = self._data.get(currency, {}).get("tomorrow") or {}
         for area in self.areas:
-            values = (areas.get(area) or {}).get("values") or []
-            if len(values) < 23:
+            zone_name = tzs.get(area)
+            if zone_name is None:
                 return False
+            target = (stock(dt_utils.now()) + timedelta(days=1)).date()
+            tzinfo = timezone(zone_name)
+            values = (areas.get(area) or {}).get("values") or []
+            if not day_coverage(values, target, tzinfo):
+                return False
+        return True
+
+    def _today_fresh(self) -> bool:
+        """Check if today's prices still cover the current moment for all
+        currencies/areas (review F2: midnight fetch failure used to leave
+        yesterday's data with no retry for the rest of the day)."""
+        if not self.currency:
+            return False
+        local_now = dt_utils.now()
+        for currency in self.currency:
+            areas = self._data.get(currency, {}).get("today") or {}
+            for area in self.areas:
+                values = (areas.get(area) or {}).get("values") or []
+                covering = [
+                    v for v in values
+                    if v.get("start") <= local_now < v.get("end")
+                ]
+                if not covering:
+                    return False
         return True
 
     async def update_today(self, areas=None):
@@ -177,25 +224,60 @@ class NordpoolData:
             hour=13, minute=RANDOM_MINUTE, second=RANDOM_SECOND
         )
         if stockholm_now < publication:
-            return False
+            # Before publication, only a missing today dataset needs healing.
+            return await self._maybe_refetch_today(now)
         if self.tomorrow_valid():
-            return False
+            # Tomorrow is fine; today may still need healing (e.g. restart
+            # after a midnight fetch failure).
+            return await self._maybe_refetch_today(now)
         if self._tomorrow_retry_after is not None and now < self._tomorrow_retry_after:
-            return False
+            return await self._maybe_refetch_today(now)
 
         self._tomorrow_retry_after = now + timedelta(minutes=15)
         _LOGGER.debug("Self-heal: refetching tomorrows prices")
         try:
-            await self.update_tomorrow()
+            async with self._update_lock:
+                await self.update_tomorrow()
         except InvalidValueException:
             _LOGGER.debug("Self-heal: no valid tomorrow data yet")
         except aiohttp.ClientError as err:
             _LOGGER.warning("Self-heal: fetch failed: %s", err)
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.warning("Self-heal: unexpected error: %s", err)
+        except Exception:  # pylint: disable=broad-except
+            # Review F5: log the full traceback so programming errors are
+            # not silently converted into "expected" retries.
+            _LOGGER.exception("Self-heal: unexpected error")
         else:
             if self.tomorrow_valid():
                 _LOGGER.info("Self-heal: tomorrows prices now available")
+                async_dispatcher_send(self._hass, EVENT_NEW_PRICE)
+                return True
+        return await self._maybe_refetch_today(now)
+
+    async def _maybe_refetch_today(self, now) -> bool:
+        """Retry today's dataset if it does not cover the current moment.
+
+        Review F2: a midnight fetch failure used to leave the sensor on
+        stale data for the whole day with no retry path. Throttled to one
+        fetch per 15 minutes, guarded by the shared update lock.
+        """
+        if self._today_fresh():
+            return False
+        if self._today_retry_after is not None and now < self._today_retry_after:
+            return False
+        self._today_retry_after = now + timedelta(minutes=15)
+        _LOGGER.debug("Self-heal: refetching todays prices")
+        try:
+            async with self._update_lock:
+                await self.update_today()
+        except InvalidValueException:
+            _LOGGER.debug("Self-heal: no valid today data yet")
+        except aiohttp.ClientError as err:
+            _LOGGER.warning("Self-heal: today fetch failed: %s", err)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("Self-heal: unexpected error in today fetch")
+        else:
+            if self._today_fresh():
+                _LOGGER.info("Self-heal: todays prices now available")
                 async_dispatcher_send(self._hass, EVENT_NEW_PRICE)
                 return True
         return False
@@ -206,17 +288,29 @@ class NordpoolData:
         If the tomorrow dataset is invalid or missing (publication failed
         the previous day), keep the old today data instead of overwriting
         it with None, and clear the tomorrow slot for the new cycle.
+
+        Review F3: promote per currency, but fetch the missing today data
+        only once per rotation (update_today walks all currencies anyway,
+        so calling it per invalid currency would cause N x N fetches).
         """
+        promoted = {}
+        needs_fetch = False
         for curr in self.currency:
             if self._tomorrow_valid_for_currency(curr):
-                self._data[curr]["today"] = self._data[curr]["tomorrow"]
+                promoted[curr] = self._data[curr]["tomorrow"]
             else:
-                try:
+                needs_fetch = True
+        if needs_fetch:
+            try:
+                async with self._update_lock:
                     await self.update_today()
-                except InvalidValueException:
-                    _LOGGER.debug("No valid data for today at day change")
-                except aiohttp.ClientError as err:
-                    _LOGGER.warning("Failed to update today at day change: %s", err)
+            except InvalidValueException:
+                _LOGGER.debug("No valid data for today at day change")
+            except aiohttp.ClientError as err:
+                _LOGGER.warning("Failed to update today at day change: %s", err)
+        for curr in self.currency:
+            if curr in promoted:
+                self._data[curr]["today"] = promoted[curr]
             self._data[curr]["tomorrow"] = {}
 
 
@@ -232,8 +326,9 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             """Cb to handle some house keeping when it a new day."""
             _LOGGER.debug("Called new_day_cb callback")
 
-            # Reset the self-heal throttle for the new publication cycle.
+            # Reset the self-heal throttles for the new publication cycle.
             api._tomorrow_retry_after = None
+            api._today_retry_after = None
             await api.rotate_to_new_day()
 
             async_dispatcher_send(hass, EVENT_NEW_DAY)

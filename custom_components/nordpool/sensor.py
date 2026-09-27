@@ -1,5 +1,6 @@
 import logging
 import math
+from datetime import timedelta
 from operator import itemgetter
 from statistics import mean, median
 
@@ -10,6 +11,7 @@ from homeassistant.const import CONF_REGION
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.template import Template
 from homeassistant.util import dt as dt_utils
+from pytz import timezone
 
 # Import sensor entity and classes.
 from homeassistant.components.sensor.const import (
@@ -422,12 +424,33 @@ class NordpoolSensor(SensorEntity):
 
     @property
     def tomorrow_valid(self) -> bool:
-        """Verify that we have the values for tomorrow."""
-        # this should be checked a better way
-        return len([i for i in self.tomorrow if i not in (None, float("inf"))]) >= 23
+        """Verify that we have the values for tomorrow.
 
-    async def _update_current_price(self) -> None:
-        """update the current price (price this hour)"""
+        Review F1: the old >= 23 rows heuristic predates the 15-minute
+        MTU (a day now has 96 rows); it would accept a 5h45m partial
+        dataset as complete. Use interval coverage of the whole local
+        day instead, which works for 60- and 15-minute data alike.
+        """
+        from .misc import day_coverage
+        from .const import tzs as _tzs
+
+        if self._data_tomorrow is None or self._data_tomorrow is SENTINEL:
+            return False
+        zone_name = _tzs.get(self._area)
+        if zone_name is None:
+            return False
+        target = (stock(dt_utils.now()) + timedelta(days=1)).date()
+        tzinfo = timezone(zone_name)
+        values = self._data_tomorrow.get("values") or []
+        return day_coverage(values, target, tzinfo)
+
+    async def _update_current_price(self) -> bool:
+        """update the current price (price this hour).
+
+        Returns True when the current moment is covered by a fresh
+        interval, so callers can distinguish "kept old value" (False)
+        from a genuine refresh (True) - see handle_new_hr.
+        """
         local_now = dt_utils.now()
 
         data = await self._api.today(self._area, self._currency)
@@ -438,8 +461,10 @@ class NordpoolSensor(SensorEntity):
                     _LOGGER.debug(
                         "Updated %s _current_price %s", self.name, item["value"]
                     )
+                    return True
         else:
             _LOGGER.debug("Cant update _update_current_price because it was no data")
+        return False
 
     async def handle_new_day(self):
         """Update attrs for the new day"""
@@ -468,13 +493,21 @@ class NordpoolSensor(SensorEntity):
 
         self._update()
         # Updates the current for this hour.
-        await self._update_current_price()
-        # State-hold for issue #502: if the current price could not be
-        # refreshed (for example during the day-ahead publication gap or a
-        # failed fetch), keep the last known value instead of writing an
-        # unavailable state. This mirrors how other integrations handle
-        # temporary upstream outages.
+        refreshed = await self._update_current_price()
+        # State-hold for issue #502/#528: if the current price could not be
+        # refreshed (day-ahead publication gap, failed fetch, or the current
+        # moment not covered by any interval), keep the last known value
+        # instead of writing an unavailable state. The value is genuinely
+        # stale, but with the self-heal retry in the hourly callback the
+        # sensor will refresh as soon as the API recovers, and VILP's
+        # fail-closed logic (hold sensors) treats long gaps as expensive.
         if self._current_price is not None:
+            if not refreshed:
+                _LOGGER.debug(
+                    "%s: current price not covered by fresh data, keeping last known value %s",
+                    self.name,
+                    self._current_price,
+                )
             self._attr_native_value = self.current_price
             self.async_write_ha_state()
         else:
