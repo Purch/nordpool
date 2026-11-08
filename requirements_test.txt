@@ -1,0 +1,11 @@
+# Dependencies for the isolated regression suite (Home Assistant is stubbed).
+aiohttp
+backoff
+black
+Jinja2
+pytest
+pytest-asyncio
+python-dateutil
+pytz
+tzdata
+voluptuous
