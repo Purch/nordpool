@@ -20,8 +20,8 @@ HELSINKI = ZoneInfo("Europe/Helsinki")
 FIXED_NOW = datetime(2026, 9, 27, 15, 0, tzinfo=HELSINKI)
 
 
-def make_values(day, *, count=96, value=50.0):
-    current = datetime(day.year, day.month, day.day, tzinfo=HELSINKI).astimezone(
+def make_values(day, *, count=96, value=50.0, zone=HELSINKI):
+    current = datetime(day.year, day.month, day.day, tzinfo=zone).astimezone(
         timezone.utc
     )
     values = []
@@ -29,8 +29,8 @@ def make_values(day, *, count=96, value=50.0):
         next_value = current + timedelta(minutes=15)
         values.append(
             {
-                "start": current.astimezone(HELSINKI),
-                "end": next_value.astimezone(HELSINKI),
+                "start": current.astimezone(zone),
+                "end": next_value.astimezone(zone),
                 "value": value,
             }
         )
@@ -169,7 +169,7 @@ async def test_day_change_never_replaces_today_with_none():
 
     await api.rotate_to_new_day(FIXED_NOW + timedelta(days=1))
 
-    assert api._data["EUR"]["today"] is old_today
+    assert api._data["EUR"]["today"] == {}
 
 
 @pytest.mark.asyncio
@@ -242,7 +242,7 @@ async def test_midnight_promotes_cached_prices_without_fetching(monkeypatch):
     await callbacks["new_hr"](now)
 
     fetch.assert_not_awaited()
-    assert api._data["EUR"]["today"] is promoted
+    assert api._data["EUR"]["today"] == {"FI": sensor._data_today}
     assert api._data["EUR"]["tomorrow"] == {}
     assert sensor.raw_today[0]["value"] == 0.1
     assert sensor.raw_tomorrow == []
@@ -251,8 +251,8 @@ async def test_midnight_promotes_cached_prices_without_fetching(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_midnight_tick_before_day_change_is_a_no_op(monkeypatch):
-    """Both timers fire at 00:00:00; new_hr may run before new_day_cb."""
+async def test_midnight_tick_before_day_change_rolls_over_once(monkeypatch):
+    """Either timer owns the shared tick; the second must do nothing."""
     now = (FIXED_NOW + timedelta(days=1)).replace(hour=0, minute=0)
     monkeypatch.setattr(nordpool.dt_utils, "now", lambda: now)
     api, callbacks = await make_timer_api(monkeypatch)
@@ -266,13 +266,13 @@ async def test_midnight_tick_before_day_change_is_a_no_op(monkeypatch):
     await callbacks["new_hr"](now)
 
     fetch.assert_not_awaited()
-    DISPATCHER_SEND.assert_not_called()
+    DISPATCHER_SEND.assert_called_once_with(api._hass, nordpool.EVENT_NEW_DAY, ["FI"])
 
     await callbacks["new_day_cb"](now)
 
     fetch.assert_not_awaited()
-    assert api._data["EUR"]["today"] is promoted
-    DISPATCHER_SEND.assert_called_once_with(api._hass, nordpool.EVENT_NEW_DAY)
+    assert api._data["EUR"]["today"]["FI"]["values"][0]["value"] == 100.0
+    DISPATCHER_SEND.assert_called_once_with(api._hass, nordpool.EVENT_NEW_DAY, ["FI"])
 
 
 @pytest.mark.asyncio
@@ -296,10 +296,10 @@ async def test_missing_today_recovers_after_midnight(monkeypatch, failure):
 
     await callbacks["new_day_cb"](now)
     await sensor.handle_new_day()
-    assert api._data["EUR"]["today"] is old_today
+    assert api._data["EUR"]["today"] == {}
     assert sensor.current_price == sensor._attr_native_value == 0.042
     assert sensor.raw_tomorrow == []
-    DISPATCHER_SEND.assert_called_with(api._hass, nordpool.EVENT_NEW_DAY)
+    DISPATCHER_SEND.assert_called_with(api._hass, nordpool.EVENT_NEW_DAY, ["FI"])
 
     now += timedelta(minutes=15)
     await callbacks["new_hr"](now)
@@ -634,3 +634,134 @@ async def test_nonfinite_calculated_price_does_not_replace_last_value(
     await sensor.handle_new_hr()
 
     assert sensor.current_price == sensor._attr_native_value == 0.042
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["new_hr", "new_day_cb", "concurrent"])
+@pytest.mark.parametrize(
+    "area,ha_zone",
+    [("FI", "Europe/Stockholm"), ("SE3", "Europe/Helsinki"), ("FI", "UTC")],
+)
+async def test_area_midnight_orders_callbacks_once(monkeypatch, first, area, ha_zone):
+    zone = ZoneInfo("Europe/Helsinki" if area == "FI" else "Europe/Stockholm")
+    local_now = datetime(2026, 11, 9, tzinfo=zone)
+    now = local_now.astimezone(ZoneInfo(ha_zone))
+    monkeypatch.setattr(nordpool.dt_utils, "now", lambda: now)
+    api, callbacks = await make_timer_api(monkeypatch)
+    api.areas = [area]
+    data = make_values(local_now.date(), zone=zone)
+    api._data["EUR"]["today"] = {
+        area: make_values(local_now.date() - timedelta(days=1), zone=zone)
+    }
+    api._data["EUR"]["tomorrow"] = {area: data}
+    fetch = AsyncMock()
+    monkeypatch.setattr(AioPrices, "hourly", fetch)
+    DISPATCHER_SEND.reset_mock()
+    if first == "concurrent":
+        await asyncio.gather(callbacks["new_hr"](now), callbacks["new_day_cb"](now))
+    else:
+        second = "new_day_cb" if first == "new_hr" else "new_hr"
+        await callbacks[first](now)
+        await callbacks[second](now)
+    fetch.assert_not_awaited()
+    assert api._data["EUR"]["today"][area] is data
+    DISPATCHER_SEND.assert_called_once_with(api._hass, nordpool.EVENT_NEW_DAY, [area])
+
+
+@pytest.mark.asyncio
+async def test_two_areas_roll_over_at_separate_midnights(monkeypatch):
+    now = datetime(2026, 11, 9, tzinfo=HELSINKI)
+    monkeypatch.setattr(nordpool.dt_utils, "now", lambda: now)
+    api, callbacks = await make_timer_api(monkeypatch)
+    api.areas = ["FI", "SE3"]
+    stockholm = ZoneInfo("Europe/Stockholm")
+    fi_new = make_values(now.date())
+    se_old = make_values(now.date() - timedelta(days=1), zone=stockholm)
+    se_new = make_values(now.date(), zone=stockholm)
+    api._data["EUR"]["today"] = {
+        "FI": make_values(now.date() - timedelta(days=1)),
+        "SE3": se_old,
+    }
+    api._data["EUR"]["tomorrow"] = {"FI": fi_new, "SE3": se_new}
+    fetch = AsyncMock()
+    monkeypatch.setattr(AioPrices, "hourly", fetch)
+    DISPATCHER_SEND.reset_mock()
+    await callbacks["new_hr"](now)
+    assert api._data["EUR"]["today"] == {"FI": fi_new, "SE3": se_old}
+    assert api._data["EUR"]["tomorrow"] == {"SE3": se_new}
+    assert DISPATCHER_SEND.call_args_list[-1].args == (
+        api._hass,
+        nordpool.EVENT_NEW_HOUR,
+        ["SE3"],
+    )
+    now += timedelta(hours=1)
+    await callbacks["new_day_cb"](now)
+    assert api._data["EUR"]["today"] == {"FI": fi_new, "SE3": se_new}
+    assert api._data["EUR"]["tomorrow"] == {}
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "day,count", [(datetime(2027, 3, 28), 92), (datetime(2027, 10, 31), 100)]
+)
+async def test_area_rollover_promotes_dst_delivery_day(monkeypatch, day, count):
+    now = day.replace(tzinfo=HELSINKI)
+    monkeypatch.setattr(nordpool.dt_utils, "now", lambda: now)
+    api, callbacks = await make_timer_api(monkeypatch)
+    data = make_values(now.date(), count=count)
+    api._data["EUR"]["tomorrow"] = {"FI": data}
+    fetch = AsyncMock()
+    monkeypatch.setattr(AioPrices, "hourly", fetch)
+    await callbacks["new_hr"](now)
+    assert api._data["EUR"]["today"]["FI"] is data
+    assert api.today_valid(now)
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_rollover_clears_old_lists_but_retains_price(monkeypatch):
+    now = datetime(2026, 11, 9, tzinfo=HELSINKI)
+    monkeypatch.setattr(nordpool.dt_utils, "now", lambda: now)
+    api, callbacks = await make_timer_api(monkeypatch)
+    old = make_values(now.date() - timedelta(days=1))
+    api._data["EUR"]["today"] = {"FI": old}
+    api._data["EUR"]["tomorrow"] = {"FI": make_values(now.date(), count=23)}
+    monkeypatch.setattr(AioPrices, "hourly", AsyncMock(side_effect=TimeoutError()))
+    sensor = make_sensor(current_price=42.0, native_value=0.042)
+    sensor._api = api
+    sensor._data_today = old
+    sensor._average = 123
+    await callbacks["new_hr"](now)
+    await sensor.handle_new_day(["FI"])
+    assert sensor.raw_today == []
+    assert sensor.raw_tomorrow == []
+    assert sensor._average is None
+    assert sensor.current_price == 0.042
+    sensor.async_write_ha_state.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_area_notifications_ignore_other_sensors():
+    sensor = make_sensor(current_price=42.0, native_value=0.042)
+    await sensor.handle_new_day(["SE3"])
+    await sensor.handle_new_hr(["SE3"])
+    sensor._api.today.assert_not_called()
+    sensor.async_write_ha_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_partial_rollover_recovery_keeps_complete_promoted_area(monkeypatch):
+    now = datetime(2026, 11, 9, tzinfo=HELSINKI)
+    monkeypatch.setattr(nordpool.dt_utils, "now", lambda: now)
+    api = make_api()
+    api.areas = ["FI", "EE"]
+    complete = make_values(now.date())
+    partial = make_values(now.date(), count=1)
+    api._data["EUR"]["tomorrow"] = {"FI": complete}
+    monkeypatch.setattr(
+        AioPrices, "hourly", AsyncMock(return_value={"areas": {"EE": partial}})
+    )
+    await api.rotate_to_new_day(now)
+    assert api._data["EUR"]["today"] == {"FI": complete, "EE": partial}
+    assert not api.today_valid(now)
