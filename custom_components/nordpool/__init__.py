@@ -1,8 +1,10 @@
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import timedelta
 
 
+import aiohttp
 import backoff
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -16,6 +18,7 @@ from homeassistant.util import dt as dt_utils
 from .aio_price import AioPrices, InvalidValueException
 from .events import async_track_time_change_in_tz
 from .services import async_setup_services
+from .misc import AREA_TZINFO, day_coverage, stock
 
 from .const import (
     NAME,
@@ -29,7 +32,6 @@ from .const import (
     RANDOM_MINUTE,
     RANDOM_SECOND,
 )
-
 
 STARTUP = f"""
 -------------------------------------------------------------------
@@ -56,8 +58,10 @@ class NordpoolData:
         self.currency = []
         self.listeners = []
         self.areas = []
+        self._today_update_lock = asyncio.Lock()
+        self._tomorrow_update_lock = asyncio.Lock()
 
-    async def _update(self, type_="today", dt=None, areas=None):
+    async def _update(self, type_="today", dt=None, areas=None) -> bool:
         _LOGGER.debug("calling _update %s %s %s", type_, dt, areas)
         hass = self._hass
         client = async_get_clientsession(hass)
@@ -71,6 +75,7 @@ class NordpoolData:
         # when the region is in another timezone
         # as we request data for 3 days anyway.
         # Keeping this for now, but this should be changed.
+        updated = False
         for currency in self.currency:
             spot = AioPrices(currency, client)
             data = await spot.hourly(
@@ -78,24 +83,76 @@ class NordpoolData:
             )
             if data:
                 self._data[currency][type_] = data["areas"]
+                updated = True
+        return updated
 
-    async def update_today(self, areas=None):
-        """Update today's prices"""
+    def _day_valid_for_currency(
+        self, currency, day, target_offset_days, now=None
+    ) -> bool:
+        """Return whether usable cached prices cover the target delivery day."""
+        areas = self._data.get(currency, {}).get(day) or {}
+        now = now or dt_utils.now()
+        for area in self.areas:
+            tzinfo = AREA_TZINFO.get(area)
+            if tzinfo is None:
+                return False
+            target_date = now.astimezone(tzinfo).date() + timedelta(
+                days=target_offset_days
+            )
+            values = (areas.get(area) or {}).get("values") or []
+            if not day_coverage(values, target_date, tzinfo):
+                return False
+        return bool(self.areas)
+
+    def _tomorrow_valid_for_currency(
+        self, currency, target_offset_days=1, now=None
+    ) -> bool:
+        """Check day-ahead data for tomorrow or the midnight promotion target."""
+        return self._day_valid_for_currency(
+            currency, "tomorrow", target_offset_days, now
+        )
+
+    def today_valid(self, now=None) -> bool:
+        """Return whether today's usable prices cover all active areas."""
+        return bool(self.currency) and all(
+            self._day_valid_for_currency(currency, "today", 0, now)
+            for currency in self.currency
+        )
+
+    def tomorrow_valid(self, now=None) -> bool:
+        """Return whether tomorrow prices are complete for all active sensors."""
+        return bool(self.currency) and all(
+            self._tomorrow_valid_for_currency(currency, now=now)
+            for currency in self.currency
+        )
+
+    async def update_today(self, areas=None, only_if_missing=False, now=None) -> bool:
+        """Update today's prices, optionally skipping an already complete cache."""
         _LOGGER.debug("Updating today's prices.")
         if areas is not None:
             self.areas += [area for area in areas if area not in self.areas]
-        await self._update("today", areas=self.areas if len(self.areas) > 0 else None)
+        async with self._today_update_lock:
+            if only_if_missing and self.today_valid(now):
+                return False
+            return await self._update(
+                "today", areas=self.areas if len(self.areas) > 0 else None
+            )
 
-    async def update_tomorrow(self, areas=None):
-        """Update tomorrows prices."""
-        _LOGGER.debug("Updating tomorrows prices.")
+    async def update_tomorrow(
+        self, areas=None, only_if_missing=False, now=None
+    ) -> bool:
+        """Update tomorrow's prices."""
+        _LOGGER.debug("Updating tomorrow's prices.")
         if areas is not None:
             self.areas += [area for area in areas if area not in self.areas]
-        await self._update(
-            type_="tomorrow",
-            dt=dt_utils.now() + timedelta(hours=24),
-            areas=self.areas if len(self.areas) > 0 else None,
-        )
+        async with self._tomorrow_update_lock:
+            if only_if_missing and self.tomorrow_valid(now):
+                return False
+            return await self._update(
+                type_="tomorrow",
+                dt=dt_utils.now() + timedelta(hours=24),
+                areas=self.areas if len(self.areas) > 0 else None,
+            )
 
     async def _someday(self, area: str, currency: str, day: str):
         """Returns today's or tomorrow's prices in an area in the currency"""
@@ -115,10 +172,14 @@ class NordpoolData:
                 await self.update_today(areas=self.areas)
             except InvalidValueException:
                 _LOGGER.debug("No data available for today, retrying later")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                _LOGGER.warning("Initial today price fetch failed: %s", err)
             try:
                 await self.update_tomorrow(areas=self.areas)
             except InvalidValueException:
                 _LOGGER.debug("No data available for tomorrow, retrying later")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                _LOGGER.warning("Initial tomorrow price fetch failed: %s", err)
 
             # Send a new data request after new data is updated for this first run
             # This way if the user has multiple sensors they will all update
@@ -134,6 +195,80 @@ class NordpoolData:
         """Returns tomorrow's prices in an area in the requested currency"""
         return await self._someday(area, currency, "tomorrow")
 
+    async def maybe_refetch_today(self, now) -> bool:
+        """Recover missing current-day data without fetching a complete cache."""
+        if self.today_valid(now):
+            return False
+
+        try:
+            updated = await self.update_today(only_if_missing=True, now=now)
+        except InvalidValueException:
+            _LOGGER.debug("Today prices are not available yet")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning("Today price retry failed: %s", err)
+        else:
+            if updated:
+                # A partial response can still provide the current interval.
+                async_dispatcher_send(self._hass, EVENT_NEW_HOUR)
+            return self.today_valid(now)
+        return False
+
+    async def maybe_refetch_tomorrow(self, now) -> bool:
+        """Retry delayed tomorrow prices after the publication time."""
+        stockholm_now = stock(now)
+        # Finland changes delivery day before Stockholm. The previous day's
+        # publication window must not trigger a fetch for the new tomorrow.
+        if any(
+            now.astimezone(AREA_TZINFO[area]).date() > stockholm_now.date()
+            for area in self.areas
+            if area in AREA_TZINFO
+        ):
+            return False
+        publication = stockholm_now.replace(
+            hour=13, minute=RANDOM_MINUTE, second=RANDOM_SECOND
+        )
+        if stockholm_now < publication or self.tomorrow_valid(now):
+            return False
+
+        _LOGGER.debug("Tomorrow prices incomplete; retrying the fetch")
+        try:
+            await self.update_tomorrow(only_if_missing=True, now=now)
+        except InvalidValueException:
+            _LOGGER.debug("Tomorrow prices are not available yet")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning("Tomorrow price retry failed: %s", err)
+        else:
+            if self.tomorrow_valid(now):
+                _LOGGER.info("Tomorrow prices are now available")
+                async_dispatcher_send(self._hass, EVENT_NEW_PRICE)
+                return True
+        return False
+
+    async def rotate_to_new_day(self, now) -> None:
+        """Promote complete day-ahead data while preserving the existing cache."""
+        promoted = {}
+        needs_today_fetch = False
+        for currency in self.currency:
+            if self._tomorrow_valid_for_currency(
+                currency, target_offset_days=0, now=now
+            ):
+                promoted[currency] = self._data[currency]["tomorrow"]
+            else:
+                needs_today_fetch = True
+
+        if needs_today_fetch:
+            try:
+                await self.update_today()
+            except InvalidValueException:
+                _LOGGER.debug("Today prices are not available at day change")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                _LOGGER.warning("Today price fetch failed at day change: %s", err)
+
+        for currency in self.currency:
+            if currency in promoted:
+                self._data[currency]["today"] = promoted[currency]
+            self._data[currency]["tomorrow"] = {}
+
 
 async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up using yaml config file."""
@@ -143,23 +278,28 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _LOGGER.debug("Added %s to hass.data", DOMAIN)
         await async_setup_services(hass)
 
-        async def new_day_cb(_):
-            """Cb to handle some house keeping when it a new day."""
+        async def new_day_cb(now):
+            """Roll over cached prices and notify sensors at local midnight."""
             _LOGGER.debug("Called new_day_cb callback")
 
-            for curr in api.currency:
-                if not api._data.get(curr, {}).get("tomorrow"):
-                    api._data[curr]["today"] = await api.update_today()
-                else:
-                    api._data[curr]["today"] = api._data[curr]["tomorrow"]
-                api._data[curr]["tomorrow"] = {}
+            await api.rotate_to_new_day(now)
 
             async_dispatcher_send(hass, EVENT_NEW_DAY)
 
         async def new_hr(_):
-            """Callback to tell the sensors to update on a new hour."""
+            """Update cached current prices and retry missing data every 15 minutes."""
             _LOGGER.debug("Called new_hr callback")
+            now = dt_utils.now()
+            if now.hour == 0 and now.minute == 0:
+                # new_day_cb fires on the same tick and owns the rollover. Its
+                # order relative to this callback is not guaranteed; running
+                # first would publish yesterday's price with the old day's
+                # statistics and fetch today's prices that are already cached.
+                return
+            # Future-price I/O must not gate the cached current-price update.
             async_dispatcher_send(hass, EVENT_NEW_HOUR)
+            await api.maybe_refetch_today(dt_utils.now())
+            await api.maybe_refetch_tomorrow(dt_utils.now())
 
         @backoff.on_exception(
             backoff.constant,
@@ -169,13 +309,15 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             max_time=7200,
             jitter=None,
         )
-        async def new_data_cb(_):
-            """Callback to fetch new data for tomorrows prices at 1300ish CET
-            and notify any sensors, about the new data
-            """
-            # _LOGGER.debug("Called new_data_cb")
-            await api.update_tomorrow()
-            async_dispatcher_send(hass, EVENT_NEW_PRICE)
+        async def new_data_cb(now):
+            """Fetch day-ahead prices at the Europe/Stockholm publication check."""
+            try:
+                await api.update_tomorrow(only_if_missing=True, now=now)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                _LOGGER.warning("Scheduled tomorrow price fetch failed: %s", err)
+                return
+            if api.tomorrow_valid(now):
+                async_dispatcher_send(hass, EVENT_NEW_PRICE)
 
         # Handles futures updates
         cb_update_tomorrow = async_track_time_change_in_tz(
@@ -191,7 +333,9 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             hass, new_day_cb, hour=0, minute=0, second=0
         )
 
-        cb_new_hr = async_track_time_change(hass, new_hr, minute=[0, 15, 30, 45], second=0)
+        cb_new_hr = async_track_time_change(
+            hass, new_hr, minute=[0, 15, 30, 45], second=0
+        )
 
         api.listeners.append(cb_update_tomorrow)
         api.listeners.append(cb_new_hr)

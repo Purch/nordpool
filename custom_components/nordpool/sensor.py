@@ -1,5 +1,6 @@
 import logging
 import math
+from datetime import timedelta
 from operator import itemgetter
 from statistics import mean, median
 
@@ -17,7 +18,7 @@ from homeassistant.components.sensor.const import (
     SensorStateClass,
 )
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import RestoreSensor
 from jinja2 import pass_context
 
 from .const import (
@@ -35,8 +36,7 @@ from .const import (
     _CURRENTY_TO_CENTS,
     _CENT_MULTIPLIER,
 )
-from .misc import start_of, stock
-
+from .misc import AREA_TZINFO, day_coverage, is_valid_price, start_of, stock
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ async def async_setup_entry(hass, config_entry, async_add_devices):
     return True
 
 
-class NordpoolSensor(SensorEntity):
+class NordpoolSensor(RestoreSensor):
     "Sensors data"
 
     _attr_device_class = SensorDeviceClass.MONETARY
@@ -321,10 +321,8 @@ class NordpoolSensor(SensorEntity):
 
     @property
     def current_price(self) -> float:
-        """This the current price for the hour we are in at any given time."""
-        res = self._calc_price()
-        # _LOGGER.debug("Current hours price for %s is %s", self.name, res)
-        return res
+        """Return the published price, including its last-known-value fallback."""
+        return self._attr_native_value
 
     def _someday(self, data) -> list:
         """The data is already sorted in the xml,
@@ -356,7 +354,7 @@ class NordpoolSensor(SensorEntity):
         return [
             self._calc_price(i["value"], fake_dt=i["start"])
             for i in self._someday(self._data_today)
-            if i
+            if is_valid_price(i["value"])
         ]
 
     @property
@@ -369,7 +367,7 @@ class NordpoolSensor(SensorEntity):
         return [
             self._calc_price(i["value"], fake_dt=i["start"])
             for i in self._someday(self._data_tomorrow)
-            if i
+            if is_valid_price(i["value"])
         ]
 
     @property
@@ -402,6 +400,8 @@ class NordpoolSensor(SensorEntity):
         """Helper"""
         result = []
         for res in self._someday(data):
+            if not is_valid_price(res["value"]):
+                continue
             item = {
                 "start": res["start"],
                 "end": res["end"],
@@ -423,23 +423,34 @@ class NordpoolSensor(SensorEntity):
     @property
     def tomorrow_valid(self) -> bool:
         """Verify that we have the values for tomorrow."""
-        # this should be checked a better way
-        return len([i for i in self.tomorrow if i not in (None, float("inf"))]) >= 23
+        if self._data_tomorrow in (None, SENTINEL):
+            return False
+        tzinfo = AREA_TZINFO.get(self._area)
+        if tzinfo is None:
+            return False
+        target_date = dt_utils.now().astimezone(tzinfo).date() + timedelta(days=1)
+        return day_coverage(
+            self._data_tomorrow.get("values") or [], target_date, tzinfo
+        )
 
-    async def _update_current_price(self) -> None:
-        """update the current price (price this hour)"""
+    async def _update_current_price(self) -> bool:
+        """Update the raw active-interval price; return False if none is usable."""
         local_now = dt_utils.now()
 
         data = await self._api.today(self._area, self._currency)
         if data:
             for item in self._someday(data):
                 if item["start"] <= local_now < item["end"]:
-                    self._current_price = item["value"]
-                    _LOGGER.debug(
-                        "Updated %s _current_price %s", self.name, item["value"]
-                    )
+                    value = item["value"]
+                    if not is_valid_price(value):
+                        _LOGGER.debug("Ignoring invalid current price %r", value)
+                        return False
+                    self._current_price = value
+                    _LOGGER.debug("Updated %s _current_price %s", self.name, value)
+                    return True
         else:
-            _LOGGER.debug("Cant update _update_current_price because it was no data")
+            _LOGGER.debug("Cannot update the current price: no data available")
+        return False
 
     async def handle_new_day(self):
         """Update attrs for the new day"""
@@ -449,7 +460,7 @@ class NordpoolSensor(SensorEntity):
         await self.handle_new_hr()
 
     async def handle_new_hr(self):
-        """Update attrs for the new hour"""
+        """Update attributes and the price for the active delivery interval."""
         _LOGGER.debug("handle_new_hr")
         today = await self._api.today(self._area, self._currency)
         if today:
@@ -464,11 +475,19 @@ class NordpoolSensor(SensorEntity):
                 self._data_tomorrow = tomorrow
 
         self._update()
-        # Updates the current for this hour.
-        await self._update_current_price()
-        # This is not to make sure the correct template costs are set. Issue 258
-        self._attr_native_value = self.current_price
-        self.async_write_ha_state()
+        if await self._update_current_price():
+            # Recalculate additional costs for the current interval (issue #258).
+            price = self._calc_price()
+            if is_valid_price(price):
+                self._attr_native_value = price
+
+        # The price sensor is an input to cost-control automations. Keep the last
+        # numeric value during a temporary Nord Pool publication gap instead of
+        # replacing it with an unavailable/unknown state.
+        if self._attr_native_value is not None:
+            self.async_write_ha_state()
+        else:
+            _LOGGER.debug("%s: waiting for the first valid price", self.name)
 
     async def handle_new_price(self):
         """Update atts because of the new prices"""
@@ -483,6 +502,12 @@ class NordpoolSensor(SensorEntity):
         """Connect to dispatcher listening for entity data notifications."""
         await super().async_added_to_hass()
         _LOGGER.debug("called async_added_to_hass %s", self.name)
+
+        if (last_data := await self.async_get_last_sensor_data()) is not None:
+            last_value = last_data.native_value
+            if is_valid_price(last_value):
+                # Native values already include units, VAT and additional costs.
+                self._attr_native_value = last_value
 
         async_dispatcher_connect(self._api._hass, EVENT_NEW_DAY, self.handle_new_day)
         async_dispatcher_connect(

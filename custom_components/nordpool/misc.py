@@ -1,12 +1,16 @@
 import logging
+import math
 from collections import defaultdict
 from operator import itemgetter
 from statistics import mean
 from decimal import Decimal
+from datetime import datetime, timedelta
 
 import pytz
 from homeassistant.util import dt as dt_util
 from pytz import timezone
+
+from .const import tzs as _AREA_TIMEZONES
 
 UTC = pytz.utc
 
@@ -18,11 +22,15 @@ __all__ = [
     "end_of",
     "stock",
     "add_junk",
+    "day_coverage",
+    "AREA_TZINFO",
+    "is_valid_price",
 ]
 
 _LOGGER = logging.getLogger(__name__)
 
 stockholm_tz = timezone("Europe/Stockholm")
+AREA_TZINFO = {area: timezone(zone_name) for area, zone_name in _AREA_TIMEZONES.items()}
 
 
 def exceptions_raiser():
@@ -53,6 +61,58 @@ def add_junk(d):
 def stock(d):
     """convert datetime to stocholm time."""
     return d.astimezone(stockholm_tz)
+
+
+def is_valid_price(value) -> bool:
+    """Accept finite numeric prices, including zero and negative prices."""
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def day_coverage(values, target_date, tzinfo) -> bool:
+    """Return whether usable intervals cover one complete local delivery day."""
+    if not values:
+        return False
+
+    try:
+        day_start = tzinfo.localize(
+            datetime(target_date.year, target_date.month, target_date.day)
+        ).astimezone(UTC)
+        day_end = tzinfo.localize(
+            datetime(target_date.year, target_date.month, target_date.day)
+            + timedelta(days=1)
+        ).astimezone(UTC)
+        intervals = []
+        for item in values:
+            start, end = item["start"], item["end"]
+            if (
+                start.utcoffset() is None
+                or end.utcoffset() is None
+                or not is_valid_price(item["value"])
+            ):
+                return False
+            intervals.append((start.astimezone(UTC), end.astimezone(UTC)))
+        intervals.sort()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+    cursor = day_start
+    for start, end in intervals:
+        if end <= start or end <= day_start:
+            continue
+        if start >= day_end:
+            break
+        start = max(start, day_start)
+        end = min(end, day_end)
+        if start > cursor:
+            return False
+        cursor = max(cursor, end)
+        if cursor >= day_end:
+            return True
+    return False
 
 
 def start_of(d, typ_="hour"):
