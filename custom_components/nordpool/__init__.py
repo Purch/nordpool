@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 
 import aiohttp
@@ -244,17 +244,27 @@ class NordpoolData:
                 return True
         return False
 
-    async def rotate_to_new_day(self, now) -> None:
-        """Promote complete day-ahead data while preserving the existing cache."""
-        promoted = {}
+    async def rotate_to_new_day(self, now, areas=None) -> None:
+        """Promote each affected area's complete prices for its new local day."""
+        areas = self.areas if areas is None else areas
         needs_today_fetch = False
-        for currency in self.currency:
-            if self._tomorrow_valid_for_currency(
-                currency, target_offset_days=0, now=now
-            ):
-                promoted[currency] = self._data[currency]["tomorrow"]
-            else:
-                needs_today_fetch = True
+        promoted = {}
+        async with self._today_update_lock, self._tomorrow_update_lock:
+            for currency in self.currency:
+                promoted[currency] = {}
+                today = self._data[currency].setdefault("today", {})
+                tomorrow = self._data[currency].get("tomorrow") or {}
+                for area in areas:
+                    zone = AREA_TZINFO.get(area)
+                    data = tomorrow.pop(area, None)
+                    values = (data or {}).get("values") or []
+                    if zone and day_coverage(values, now.astimezone(zone).date(), zone):
+                        today[area] = data
+                        promoted[currency][area] = data
+                    else:
+                        today.pop(area, None)
+                        needs_today_fetch = True
+                self._data[currency]["tomorrow"] = tomorrow
 
         if needs_today_fetch:
             try:
@@ -263,11 +273,8 @@ class NordpoolData:
                 _LOGGER.debug("Today prices are not available at day change")
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 _LOGGER.warning("Today price fetch failed at day change: %s", err)
-
-        for currency in self.currency:
-            if currency in promoted:
-                self._data[currency]["today"] = promoted[currency]
-            self._data[currency]["tomorrow"] = {}
+            for currency, data in promoted.items():
+                self._data[currency].setdefault("today", {}).update(data)
 
 
 async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -278,28 +285,42 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _LOGGER.debug("Added %s to hass.data", DOMAIN)
         await async_setup_services(hass)
 
+        tick_lock = asyncio.Lock()
+
+        async def update_tick():
+            """Run rollover before publication, once per quarter-hour tick."""
+            async with tick_lock:
+                now = dt_utils.now()
+                tick = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                if api._last_tick == tick:
+                    return
+                areas = [
+                    area
+                    for area in api.areas
+                    if area in AREA_TZINFO
+                    and now.astimezone(AREA_TZINFO[area]).hour == 0
+                    and now.minute == 0
+                ]
+                if areas:
+                    await api.rotate_to_new_day(now, areas)
+                    async_dispatcher_send(hass, EVENT_NEW_DAY, areas)
+                    remaining = [area for area in api.areas if area not in areas]
+                    if remaining:
+                        async_dispatcher_send(hass, EVENT_NEW_HOUR, remaining)
+                else:
+                    async_dispatcher_send(hass, EVENT_NEW_HOUR)
+                    await api.maybe_refetch_today(dt_utils.now())
+                api._last_tick = tick
+                await api.maybe_refetch_tomorrow(dt_utils.now())
+
         async def new_day_cb(now):
-            """Roll over cached prices and notify sensors at local midnight."""
-            _LOGGER.debug("Called new_day_cb callback")
-
-            await api.rotate_to_new_day(now)
-
-            async_dispatcher_send(hass, EVENT_NEW_DAY)
+            """Check area-local midnight through the shared serialized tick."""
+            await update_tick()
 
         async def new_hr(_):
             """Update cached current prices and retry missing data every 15 minutes."""
             _LOGGER.debug("Called new_hr callback")
-            now = dt_utils.now()
-            if now.hour == 0 and now.minute == 0:
-                # new_day_cb fires on the same tick and owns the rollover. Its
-                # order relative to this callback is not guaranteed; running
-                # first would publish yesterday's price with the old day's
-                # statistics and fetch today's prices that are already cached.
-                return
-            # Future-price I/O must not gate the cached current-price update.
-            async_dispatcher_send(hass, EVENT_NEW_HOUR)
-            await api.maybe_refetch_today(dt_utils.now())
-            await api.maybe_refetch_tomorrow(dt_utils.now())
+            await update_tick()
 
         @backoff.on_exception(
             backoff.constant,
@@ -329,9 +350,7 @@ async def _dry_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             tz=await dt_utils.async_get_time_zone("Europe/Stockholm"),
         )
 
-        cb_new_day = async_track_time_change(
-            hass, new_day_cb, hour=0, minute=0, second=0
-        )
+        cb_new_day = async_track_time_change(hass, new_day_cb, minute=0, second=0)
 
         cb_new_hr = async_track_time_change(
             hass, new_hr, minute=[0, 15, 30, 45], second=0

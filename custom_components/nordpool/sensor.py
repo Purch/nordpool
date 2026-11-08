@@ -452,15 +452,24 @@ class NordpoolSensor(RestoreSensor):
             _LOGGER.debug("Cannot update the current price: no data available")
         return False
 
-    async def handle_new_day(self):
+    async def handle_new_day(self, areas=None):
         """Update attrs for the new day"""
+        if areas is not None and self._area not in areas:
+            return
         _LOGGER.debug("handle_new_day")
+        # Yesterday's prices must not be shown as today's if the new day's
+        # prices could not be fetched.
+        self._data_today = None
         self._data_tomorrow = None
         # update attrs for the new day
+        self._average = self._min = self._max = self._mean = None
+        self._off_peak_1 = self._off_peak_2 = self._peak = None
         await self.handle_new_hr()
 
-    async def handle_new_hr(self):
+    async def handle_new_hr(self, areas=None):
         """Update attributes and the price for the active delivery interval."""
+        if areas is not None and self._area not in areas:
+            return
         _LOGGER.debug("handle_new_hr")
         today = await self._api.today(self._area, self._currency)
         if today:
